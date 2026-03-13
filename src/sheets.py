@@ -13,7 +13,8 @@ import logging
 from datetime import datetime
 from typing import Any
 
-from google.oauth2.service_account import Credentials
+from google.oauth2.service_account import Credentials as SACredentials
+from google.oauth2.credentials import Credentials as UserCredentials
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
@@ -45,8 +46,18 @@ HEADERS = {
 
 
 def _get_service(credentials_path: str):
-    """Build and return a Sheets API service instance."""
-    creds = Credentials.from_service_account_file(credentials_path, scopes=SCOPES)
+    """Build and return a Sheets API service instance.
+
+    Supports both SA key (JSON with type=service_account) and OAuth token (JSON with token field).
+    """
+    import json
+    with open(credentials_path) as f:
+        data = json.load(f)
+
+    if data.get("type") == "service_account":
+        creds = SACredentials.from_service_account_file(credentials_path, scopes=SCOPES)
+    else:
+        creds = UserCredentials.from_authorized_user_file(credentials_path, scopes=SCOPES)
     return build("sheets", "v4", credentials=creds)
 
 

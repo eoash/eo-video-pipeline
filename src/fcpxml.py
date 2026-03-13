@@ -12,6 +12,7 @@ import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
+from urllib.parse import quote
 
 
 # ---------------------------------------------------------------------------
@@ -157,9 +158,15 @@ def _build_fcpxml(video: VideoInfo, markers: list[Marker]) -> ET.Element:
         "hasAudio": "1",
         "format": fmt_id,
     })
+    # 절대경로면 file:// URL로, 상대경로면 그대로
+    filepath = Path(video.filename)
+    if filepath.is_absolute():
+        media_src = "file://" + quote(str(filepath))
+    else:
+        media_src = f"file://./{video.filename}"
     ET.SubElement(asset, "media-rep", {
         "kind": "original-media",
-        "src": f"file://./{video.filename}",
+        "src": media_src,
     })
 
     # ---- library > event > project > sequence > spine > clip ----
@@ -188,19 +195,14 @@ def _build_fcpxml(video: VideoInfo, markers: list[Marker]) -> ET.Element:
     # ---- markers ----
     for m in markers:
         marker_start = _seconds_to_rational(m.time_seconds, fps)
-        marker_el = ET.SubElement(clip, "marker", {
+        attrs = {
             "start": marker_start,
             "duration": frame_dur,
             "value": m.title,
-        })
+        }
         if m.note:
-            marker_el.set("note", m.note)
-        # FCPXML 1.11: standard marker with color via nested element.
-        # <standard-marker role="markers" color="Green"/>
-        # This is the element FCP 10.8+ / 11 uses for colored standard markers.
-        ET.SubElement(marker_el, "standard-marker", {
-            "color": _FCPXML_COLOR_NAMES[m.color],
-        })
+            attrs["note"] = m.note
+        ET.SubElement(clip, "marker", attrs)
 
     return root
 

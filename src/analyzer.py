@@ -146,13 +146,20 @@ structure. All text fields must be in Korean unless noted otherwise.
 }
 
 Guidelines:
-- This is a Korean-language interview (single interviewer + interviewee).
+- This is an interview (usually single interviewer + interviewee). The language may be
+  Korean, English, or mixed — adapt accordingly.
 - The final edited video will be ~15 minutes cut from this raw footage.
 - Identify the TOP 20 most impactful, quotable, or emotionally compelling moments.
 - For key_moments, prefer moments that would make great short-form clips or thumbnails.
 - Chapter suggestions should follow EO style: 4-6 chapters, each covering 2-5 minutes
   of the final edit. Titles should be intriguing and clickworthy.
-- For speakers, use their actual name if mentioned, otherwise use "인터뷰어" / "게스트".
+- IMPORTANT — Speaker identification:
+  - There are ALWAYS at least 2 speakers (interviewer + guest). Listen carefully for
+    voice changes, even if one speaker dominates.
+  - Use their actual name if mentioned in the conversation.
+  - If names are not mentioned, use "인터뷰어" for the person asking questions and
+    "게스트" for the person answering.
+  - Never list only one speaker unless the audio is truly a solo monologue.
 - Timestamps must be accurate to the video timeline.
 - Return ONLY valid JSON, no markdown fences or extra text.
 """
@@ -309,8 +316,11 @@ def _dict_to_result(data: dict) -> AnalysisResult:
 # Single-segment analysis
 # ---------------------------------------------------------------------------
 
-MODEL = "gemini-2.0-flash"
+MODEL = "gemini-2.5-flash"
 MAX_SEGMENT_SECONDS = 30 * 60  # 30 minutes
+
+
+MAX_RETRIES = 3
 
 
 async def _analyze_single(
@@ -318,21 +328,37 @@ async def _analyze_single(
     file_ref: types.File,
     prompt: str,
 ) -> dict:
-    """Run a single Gemini generate_content call and return parsed JSON."""
-    response = await asyncio.to_thread(
-        client.models.generate_content,
-        model=MODEL,
-        contents=[file_ref, prompt],
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            temperature=0.3,
-        ),
-    )
+    """Run a single Gemini generate_content call and return parsed JSON.
 
-    if not response.text:
-        raise RuntimeError("Gemini returned an empty response")
+    Retries up to MAX_RETRIES times on JSON parse failure.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, MAX_RETRIES + 1):
+        response = await asyncio.to_thread(
+            client.models.generate_content,
+            model=MODEL,
+            contents=[file_ref, prompt],
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.3,
+            ),
+        )
 
-    return _parse_analysis_json(response.text)
+        if not response.text:
+            raise RuntimeError("Gemini returned an empty response")
+
+        try:
+            return _parse_analysis_json(response.text)
+        except ValueError as exc:
+            last_error = exc
+            if attempt < MAX_RETRIES:
+                logger.warning(
+                    "JSON parse failed (attempt %d/%d), retrying...",
+                    attempt, MAX_RETRIES,
+                )
+                await asyncio.sleep(2)
+
+    raise last_error  # type: ignore[misc]
 
 
 # ---------------------------------------------------------------------------

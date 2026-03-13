@@ -17,6 +17,7 @@ EO Video Pipeline — 메인 오케스트레이터
 
 import argparse
 import asyncio
+import dataclasses
 import json
 import os
 import sys
@@ -120,10 +121,43 @@ async def run_analyze(video_path: str, drive_id: str | None = None):
     if spreadsheet_id:
         print("📊 Step 2/3 — Google Sheets 기록 중...")
         credentials_path = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
+        # sheets.py가 기대하는 키 이름으로 매핑
+        analysis_dict = {
+            "summary": result.summary,
+            "speakers": result.speakers,
+            "key_moments": [
+                {
+                    "timecode": km.time_seconds,
+                    "speaker": km.speaker,
+                    "quote": km.quote,
+                    "topic": km.topic,
+                    "emotion": km.emotion,
+                    "importance": km.importance,
+                }
+                for km in result.key_moments
+            ],
+            "segments": [
+                {
+                    "start": ts.start_seconds,
+                    "end": ts.end_seconds,
+                    "topic": ts.topic,
+                    "summary": ts.summary,
+                }
+                for ts in result.topic_segments
+            ],
+            "chapters": [
+                {
+                    "timecode": ch.start_seconds,
+                    "title_ko": ch.title_ko,
+                    "title": ch.title,
+                }
+                for ch in result.chapter_suggestions
+            ],
+        }
         sheet_url = write_analysis(
             spreadsheet_id=spreadsheet_id,
             video_name=video_name,
-            analysis=result.__dict__,
+            analysis=analysis_dict,
             credentials_path=credentials_path,
         )
         print(f"   ✅ 시트 기록 완료: {sheet_url}")
@@ -142,7 +176,7 @@ async def run_analyze(video_path: str, drive_id: str | None = None):
     estimated_duration = max(all_times) + 60 if all_times else 3600
 
     video_info = VideoInfo(
-        filename=Path(video_path).name,
+        filename=str(Path(video_path).resolve()),
         duration_seconds=estimated_duration,
     )
     markers = analysis_to_markers(result)
@@ -155,7 +189,7 @@ async def run_analyze(video_path: str, drive_id: str | None = None):
     # Step 4: 분석 결과 JSON 저장 (백업)
     json_path = output_dir / f"{video_name}_analysis.json"
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(result.__dict__, f, ensure_ascii=False, indent=2, default=str)
+        json.dump(dataclasses.asdict(result), f, ensure_ascii=False, indent=2)
     print(f"📄 분석 결과 JSON: {json_path}")
 
     # 요약 출력
