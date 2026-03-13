@@ -1,0 +1,40 @@
+# Environment
+.env
+.env.local
+*.local
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Node
+node_modules/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Secrets
+credentials.json
+sa-key.json
+token.json
+*.pem
+*.key
+
+# Media (don't commit video files)
+*.mp4
+*.mov
+*.mxf
+*.prores
+*.fcpxml
+!templates/*.fcpxml
+
+# Temp
+tmp/
+temp/
