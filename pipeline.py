@@ -35,6 +35,10 @@ from src.analyzer import analyze_video, AnalysisResult
 from src.fcpxml import generate_fcpxml, Marker, VideoInfo
 from src.sheets import write_analysis
 from src.drive import watch_folder, download_file, get_new_files
+from src.slack_notify import send_analysis_complete
+from src.audio_extract import needs_audio_extraction, extract_audio
+from src.nas_watch import watch_directory
+from src.checkpoint import Checkpoint
 
 
 # — Marker 색상 매핑 —
@@ -79,7 +83,7 @@ def analysis_to_markers(result: AnalysisResult) -> list[Marker]:
 
 
 async def run_analyze(video_path: str, drive_id: str | None = None):
-    """단일 영상 분석 파이프라인."""
+    """단일 영상 분석 파이프라인 (체크포인트 기반 재시도 지원)."""
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         print("❌ GEMINI_API_KEY가 .env에 설정되지 않았습니다.")
@@ -101,99 +105,181 @@ async def run_analyze(video_path: str, drive_id: str | None = None):
         sys.exit(1)
 
     video_name = Path(video_path).stem
-    print(f"\n🎬 분석 시작: {video_name}")
+    output_dir_str = os.getenv("OUTPUT_DIR", "./output")
+    output_dir = Path(output_dir_str)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # 체크포인트 로드
+    ckpt = Checkpoint(video_name, output_dir_str)
+    if ckpt.completed_stages():
+        print(f"♻️  체크포인트 발견 — 완료된 단계: {', '.join(ckpt.completed_stages())}")
+        next_stage = ckpt.next_stage()
+        if next_stage:
+            print(f"   → '{next_stage}'부터 재개합니다.")
+        else:
+            print("   → 모든 단계 완료. 결과를 출력합니다.")
+    print()
+
+    file_size_gb = Path(video_path).stat().st_size / (1024**3)
+    print(f"🎬 분석 시작: {video_name}")
     print(f"   파일: {video_path}")
+    print(f"   크기: {file_size_gb:.1f} GB")
     print(f"   시간: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print()
 
-    # Step 1: Gemini 분석
-    print("🤖 Step 1/3 — Gemini 영상 분석 중...")
-    result = await analyze_video(video_path, api_key)
-    print(f"   ✅ Transcript: {len(result.transcript)} 글자")
-    print(f"   ✅ 핵심 발언: {len(result.key_moments)}개")
-    print(f"   ✅ 주제 구간: {len(result.topic_segments)}개")
-    print(f"   ✅ 챕터 제안: {len(result.chapter_suggestions)}개")
-    print(f"   ✅ 화자: {', '.join(result.speakers)}")
+    # ── Stage 1: 오디오 추출 ──
+    if not ckpt.is_done("audio_extracted"):
+        analysis_path = video_path
+        if needs_audio_extraction(video_path):
+            print(f"📦 파일이 2GB 초과 ({file_size_gb:.1f}GB) — 오디오 추출 중...")
+            analysis_path = extract_audio(video_path, output_dir=output_dir_str)
+            audio_size_mb = Path(analysis_path).stat().st_size / (1024**2)
+            print(f"   ✅ 오디오 추출 완료: {audio_size_mb:.1f} MB")
+        ckpt.save_stage("audio_extracted", analysis_path)
+        print()
+    else:
+        analysis_path = ckpt.get("audio_extracted")
+        print(f"⏭️  오디오 추출 — 체크포인트에서 복원: {Path(analysis_path).name}")
+
+    # ── Stage 2: Gemini 분석 ──
+    if not ckpt.is_done("analysis"):
+        print("🤖 Step 2/5 — Gemini 영상 분석 중...")
+        result = await analyze_video(analysis_path, api_key)
+        ckpt.save_stage("analysis", dataclasses.asdict(result))
+        print(f"   ✅ Transcript: {len(result.transcript)} 글자")
+        print(f"   ✅ 핵심 발언: {len(result.key_moments)}개")
+        print(f"   ✅ 주제 구간: {len(result.topic_segments)}개")
+        print(f"   ✅ 챕터 제안: {len(result.chapter_suggestions)}개")
+        print(f"   ✅ 화자: {', '.join(result.speakers)}")
+    else:
+        print("⏭️  Gemini 분석 — 체크포인트에서 복원")
+        result = _rebuild_result(ckpt.get("analysis"))
     print()
 
-    # Step 2: Google Sheets 기록
-    spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID")
-    if spreadsheet_id:
-        print("📊 Step 2/3 — Google Sheets 기록 중...")
-        credentials_path = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
-        # sheets.py가 기대하는 키 이름으로 매핑
-        analysis_dict = {
-            "summary": result.summary,
-            "speakers": result.speakers,
-            "key_moments": [
+    # ── Stage 3: Google Sheets 기록 ──
+    sheet_url = None
+    if not ckpt.is_done("sheets"):
+        spreadsheet_id = os.getenv("SHEETS_SPREADSHEET_ID")
+        if spreadsheet_id:
+            print("📊 Step 3/5 — Google Sheets 기록 중...")
+            credentials_path = os.getenv("GOOGLE_CREDENTIALS_PATH", "credentials.json")
+            analysis_dict = {
+                "summary": result.summary,
+                "speakers": result.speakers,
+                "key_moments": [
+                    {
+                        "timecode": km.time_seconds,
+                        "speaker": km.speaker,
+                        "quote": km.quote,
+                        "topic": km.topic,
+                        "emotion": km.emotion,
+                        "importance": km.importance,
+                    }
+                    for km in result.key_moments
+                ],
+                "segments": [
+                    {
+                        "start": ts.start_seconds,
+                        "end": ts.end_seconds,
+                        "topic": ts.topic,
+                        "summary": ts.summary,
+                    }
+                    for ts in result.topic_segments
+                ],
+                "chapters": [
+                    {
+                        "timecode": ch.start_seconds,
+                        "title_ko": ch.title_ko,
+                        "title": ch.title,
+                    }
+                    for ch in result.chapter_suggestions
+                ],
+            }
+            sheet_url = write_analysis(
+                spreadsheet_id=spreadsheet_id,
+                video_name=video_name,
+                analysis=analysis_dict,
+                credentials_path=credentials_path,
+            )
+            print(f"   ✅ 시트 기록 완료: {sheet_url}")
+        else:
+            print("⏭️  Step 3/5 — SHEETS_SPREADSHEET_ID 미설정, 스킵")
+            sheet_url = "skipped"
+        ckpt.save_stage("sheets", sheet_url)
+    else:
+        sheet_url = ckpt.get("sheets")
+        print("⏭️  Sheets — 체크포인트에서 복원")
+    print()
+
+    # ── Stage 4: FCPXML 마커 생성 ──
+    if not ckpt.is_done("fcpxml"):
+        print("🎯 Step 4/5 — FCPXML 마커 생성 중...")
+        all_times = [km.time_seconds for km in result.key_moments]
+        all_times += [ch.start_seconds for ch in result.chapter_suggestions]
+        estimated_duration = max(all_times) + 60 if all_times else 3600
+
+        video_info = VideoInfo(
+            filename=str(Path(video_path).resolve()),
+            duration_seconds=estimated_duration,
+        )
+        markers = analysis_to_markers(result)
+        fcpxml_path = str(output_dir / f"{video_name}_markers.fcpxml")
+        generate_fcpxml(video_info, markers, fcpxml_path)
+        print(f"   ✅ FCPXML 생성: {fcpxml_path}")
+        print(f"   ✅ 마커 {len(markers)}개 포함")
+
+        # JSON 백업도 여기서 저장
+        json_path = output_dir / f"{video_name}_analysis.json"
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(dataclasses.asdict(result), f, ensure_ascii=False, indent=2)
+        print(f"   📄 분석 결과 JSON: {json_path}")
+        ckpt.save_stage("fcpxml", fcpxml_path)
+    else:
+        fcpxml_path = ckpt.get("fcpxml")
+        print(f"⏭️  FCPXML — 체크포인트에서 복원: {Path(fcpxml_path).name}")
+    print()
+
+    # ── Stage 5: Slack 알림 ──
+    if not ckpt.is_done("slack"):
+        slack_webhook = os.getenv("SLACK_WEBHOOK_URL")
+        if slack_webhook:
+            print("📨 Step 5/5 — Slack 알림 전송 중...")
+            km_dicts = [
                 {
-                    "timecode": km.time_seconds,
+                    "time_seconds": km.time_seconds,
                     "speaker": km.speaker,
                     "quote": km.quote,
-                    "topic": km.topic,
-                    "emotion": km.emotion,
                     "importance": km.importance,
                 }
                 for km in result.key_moments
-            ],
-            "segments": [
-                {
-                    "start": ts.start_seconds,
-                    "end": ts.end_seconds,
-                    "topic": ts.topic,
-                    "summary": ts.summary,
-                }
-                for ts in result.topic_segments
-            ],
-            "chapters": [
-                {
-                    "timecode": ch.start_seconds,
-                    "title_ko": ch.title_ko,
-                    "title": ch.title,
-                }
+            ]
+            ch_dicts = [
+                {"start_seconds": ch.start_seconds, "title_ko": ch.title_ko}
                 for ch in result.chapter_suggestions
-            ],
-        }
-        sheet_url = write_analysis(
-            spreadsheet_id=spreadsheet_id,
-            video_name=video_name,
-            analysis=analysis_dict,
-            credentials_path=credentials_path,
-        )
-        print(f"   ✅ 시트 기록 완료: {sheet_url}")
+            ]
+            sent = send_analysis_complete(
+                webhook_url=slack_webhook,
+                video_name=video_name,
+                summary=result.summary,
+                speakers=result.speakers,
+                key_moments=km_dicts,
+                chapters=ch_dicts,
+                fcpxml_path=fcpxml_path,
+                sheet_url=sheet_url if sheet_url != "skipped" else None,
+            )
+            if sent:
+                print("   ✅ Slack 알림 전송 완료")
+            else:
+                print("   ⚠️ Slack 알림 전송 실패 (로그 확인)")
+        else:
+            print("⏭️  Step 5/5 — SLACK_WEBHOOK_URL 미설정, 스킵")
+        ckpt.save_stage("slack", True)
     else:
-        print("⏭️  Step 2/3 — SHEETS_SPREADSHEET_ID 미설정, 스킵")
+        print("⏭️  Slack — 이미 전송됨")
     print()
-
-    # Step 3: FCPXML 마커 생성
-    print("🎯 Step 3/3 — FCPXML 마커 생성 중...")
-    output_dir = Path(os.getenv("OUTPUT_DIR", "./output"))
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    # 영상 길이 추정 (마지막 마커 기준)
-    all_times = [km.time_seconds for km in result.key_moments]
-    all_times += [ch.start_seconds for ch in result.chapter_suggestions]
-    estimated_duration = max(all_times) + 60 if all_times else 3600
-
-    video_info = VideoInfo(
-        filename=str(Path(video_path).resolve()),
-        duration_seconds=estimated_duration,
-    )
-    markers = analysis_to_markers(result)
-    fcpxml_path = str(output_dir / f"{video_name}_markers.fcpxml")
-    generate_fcpxml(video_info, markers, fcpxml_path)
-    print(f"   ✅ FCPXML 생성: {fcpxml_path}")
-    print(f"   ✅ 마커 {len(markers)}개 포함")
-    print()
-
-    # Step 4: 분석 결과 JSON 저장 (백업)
-    json_path = output_dir / f"{video_name}_analysis.json"
-    with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(dataclasses.asdict(result), f, ensure_ascii=False, indent=2)
-    print(f"📄 분석 결과 JSON: {json_path}")
 
     # 요약 출력
-    print("\n" + "=" * 60)
+    print("=" * 60)
     print(f"✨ 분석 완료: {video_name}")
     print(f"=" * 60)
     print(f"\n📋 요약: {result.summary}")
@@ -211,6 +297,19 @@ async def run_analyze(video_path: str, drive_id: str | None = None):
     print()
 
     return result
+
+
+def _rebuild_result(data: dict) -> AnalysisResult:
+    """체크포인트 JSON에서 AnalysisResult를 복원."""
+    from src.analyzer import KeyMoment, TopicSegment, ChapterSuggestion
+    return AnalysisResult(
+        transcript=data.get("transcript", ""),
+        key_moments=[KeyMoment(**km) for km in data.get("key_moments", [])],
+        topic_segments=[TopicSegment(**ts) for ts in data.get("topic_segments", [])],
+        chapter_suggestions=[ChapterSuggestion(**ch) for ch in data.get("chapter_suggestions", [])],
+        summary=data.get("summary", ""),
+        speakers=data.get("speakers", []),
+    )
 
 
 async def run_watch():
@@ -240,6 +339,24 @@ async def run_watch():
             continue
 
 
+async def run_watch_nas(nas_dir: str):
+    """NAS 폴더 직접 감시 모드 (fswatch / polling fallback)."""
+    print(f"👁️  NAS 폴더 감시 시작: {nas_dir}")
+    print(f"   새 영상이 감지되면 자동으로 분석을 시작합니다.")
+    print()
+
+    for video_path in watch_directory(nas_dir):
+        file_name = Path(video_path).name
+        file_size_gb = Path(video_path).stat().st_size / (1024**3)
+        print(f"\n🆕 새 영상 감지: {file_name} ({file_size_gb:.1f} GB)")
+
+        try:
+            await run_analyze(video_path=video_path)
+        except Exception as e:
+            print(f"❌ 분석 실패: {file_name} — {e}")
+            continue
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="EO Video Pipeline — 인터뷰 영상 자동 분석",
@@ -261,6 +378,10 @@ def main():
     # watch 명령
     subparsers.add_parser("watch", help="Google Drive 폴더 감시 모드")
 
+    # watch-nas 명령
+    nas_parser = subparsers.add_parser("watch-nas", help="NAS 폴더 직접 감시 모드 (fswatch)")
+    nas_parser.add_argument("nas_dir", help="NAS 마운트 경로 (예: /Volumes/EO_NAS/ingest)")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -275,6 +396,9 @@ def main():
 
     elif args.command == "watch":
         asyncio.run(run_watch())
+
+    elif args.command == "watch-nas":
+        asyncio.run(run_watch_nas(args.nas_dir))
 
 
 if __name__ == "__main__":
