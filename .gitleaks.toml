@@ -1,0 +1,17 @@
+# gitleaks config — 커밋 게이트용 LEAN 룰셋 (apply-gate.sh가 각 레포에 .gitleaks.toml로 배포).
+# 기본 룰셋(AWS/GCP/Slack/GitHub/private-key 등) + EO 스택 보강(Anthropic/Vercel)만.
+# FP 적게 유지 = 개발자가 게이트를 안 끄게. 넓은 스캔은 ../gitleaks-eo.toml.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "anthropic-api-key-eo"
+description = "Anthropic API key (sk-ant-)"
+regex = '''sk-ant-[a-zA-Z0-9_\-]{20,}'''
+keywords = ["sk-ant-"]
+
+[[rules]]
+id = "vercel-token-eo"
+description = "Vercel token (vcp_/vca_)"
+regex = '''v(cp|ca)_[A-Za-z0-9]{20,}'''
+keywords = ["vcp_", "vca_"]
